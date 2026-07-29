@@ -1,0 +1,490 @@
+<script lang="ts">
+	import { onMount, onDestroy, setContext } from 'svelte';
+	import { replaceState } from '$app/navigation';
+	import { Printer, Download } from '@lucide/svelte';
+	import { Button } from '$lib/components/ui/button';
+	import MarkdocRenderer from '$lib/components/markdown/MarkdocRenderer.svelte';
+	import ReportFilterBar from '$lib/components/markdown/ReportFilterBar.svelte';
+	import {
+		FILTER_CONTEXT_KEY,
+		SUPPRESS_INLINE_FILTERS_KEY,
+		type FilterContextValue
+	} from '$lib/components/markdown/filter-context';
+	import { extractReportFilters } from '$lib/services/report-filters';
+	import { renderMarkdocCell } from '$lib/services/markdoc-interp';
+	import { filterFrozenRows, shouldHideQueryCell } from '$lib/services/filter-frozen';
+	import ReportCell from './ReportCell.svelte';
+	import ShareReviewSidebar from './ShareReviewSidebar.svelte';
+	import type { PublicShareView, PublicShareCell } from '$lib/server/shared-reports';
+	import type { Cell } from '$lib/stores/notebook.svelte';
+	import type { WorkspaceTheme } from '$lib/types/theme';
+	import { buildThemeOverrideCss } from '$lib/services/workspace-theme.svelte';
+
+	interface Props {
+		data: PublicShareView;
+		initialLiveResults?: Record<
+			string,
+			{ rows: Record<string, unknown>[]; columns: string[] } | null
+		>;
+		isAuthenticated?: boolean;
+		embed?: boolean;
+		/** Org's workspace brand theme, if configured (src/lib/types/theme.ts). */
+		brandTheme?: WorkspaceTheme | null;
+	}
+
+	const {
+		data,
+		initialLiveResults = {},
+		isAuthenticated = false,
+		embed = false,
+		brandTheme = null
+	}: Props = $props();
+
+	// Server-rendered HTML never has the `.dark` class applied yet (that's
+	// toggled client-side in onMount below, after `data.theme` is known) — so
+	// the light-mode token set is what's actually visible during SSR. Threaded
+	// into ChartView's resolveCSSColor calls, which can't read a live
+	// `document` during SSR. See src/lib/utils/theme-colors.ts.
+	const ssrThemeOverrides = $derived(brandTheme?.light);
+	const themeOverrideCss = $derived(buildThemeOverrideCss(brandTheme));
+
+	const DEFAULT_POLL_MS = 300_000;
+
+	let liveResults = $state<
+		Record<string, { rows: Record<string, unknown>[]; columns: string[] } | null>
+	>({});
+	let liveErrors = $state<Record<string, string | null>>({});
+	let loadingCellIds = $state<Set<string>>(new Set());
+	let filters = $state<Record<string, string>>({});
+	let lastUpdatedAt = $state<number | null>(null);
+	let reviewSidebar = $state<ShareReviewSidebar | undefined>();
+	let loadedLiveResultsKey = '';
+
+	const reportMarkdowns = $derived(
+		data.cells
+			.filter((c) => c.cellType === 'markdown' && c.markdown?.trim())
+			.map((c) => c.markdown!)
+	);
+	const filterDefs = $derived(extractReportFilters(reportMarkdowns));
+
+	const suppressInlineFilters = {
+		get current() {
+			return filterDefs.length > 0;
+		}
+	};
+
+	$effect(() => {
+		const key = `${data.token}:${Object.keys(initialLiveResults).join('\0')}`;
+		if (key === loadedLiveResultsKey) return;
+		loadedLiveResultsKey = key;
+		liveResults = { ...initialLiveResults };
+		liveErrors = {};
+		loadingCellIds = new Set();
+		lastUpdatedAt = Object.keys(initialLiveResults).length > 0 ? Date.now() : null;
+	});
+
+	function postEmbedMessage(type: string, payload: Record<string, unknown> = {}): void {
+		if (!embed || typeof window === 'undefined') return;
+		window.parent.postMessage({ source: 'lunapad-report', type, ...payload }, '*');
+	}
+	const liveCells = $derived(data.cells.filter((c) => c.isLive));
+	const visibleCells = $derived(data.cells.filter((c) => !shouldHideQueryCell(c)));
+
+	function frozenResultForCell(cell: PublicShareCell) {
+		if (!cell.frozenResult) return null;
+		const { rows, columns } = filterFrozenRows(
+			cell.frozenResult.rows,
+			cell.frozenResult.columns,
+			filters
+		);
+		return { rows, columns };
+	}
+
+	function pythonOutputForCell(cell: PublicShareCell) {
+		return cell.pythonOutput ?? null;
+	}
+
+	const markdocCells = $derived.by((): Cell[] => {
+		return data.cells.map((cell) => {
+			let result = cell.isLive ? (liveResults[cell.id] ?? null) : frozenResultForCell(cell);
+			return {
+				cellType: cell.cellType,
+				outputName: cell.outputName,
+				result,
+				resultChartConfig: cell.resultChartConfig
+			} as unknown as Cell;
+		});
+	});
+
+	async function runLiveCell(cell: PublicShareCell): Promise<void> {
+		loadingCellIds = new Set(loadingCellIds).add(cell.id);
+		try {
+			const res = await fetch(`/api/shares/${data.token}/run`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ cellId: cell.id, filters })
+			});
+			const body = await res.json();
+			if (!res.ok) {
+				liveErrors = { ...liveErrors, [cell.id]: body.error ?? 'Failed to run query.' };
+				return;
+			}
+			liveResults = { ...liveResults, [cell.id]: { rows: body.rows, columns: body.columns } };
+			liveErrors = { ...liveErrors, [cell.id]: null };
+		} catch {
+			liveErrors = { ...liveErrors, [cell.id]: 'Failed to run query.' };
+		} finally {
+			const next = new Set(loadingCellIds);
+			next.delete(cell.id);
+			loadingCellIds = next;
+		}
+	}
+
+	async function runAllLiveCells(): Promise<void> {
+		await Promise.all(liveCells.map((c) => runLiveCell(c)));
+		lastUpdatedAt = Date.now();
+	}
+
+	function syncFiltersToURL(): void {
+		const params = new URLSearchParams();
+		for (const [key, value] of Object.entries(filters)) {
+			if (value !== '') params.set(key, value);
+		}
+		const query = params.toString();
+		replaceState(query ? `?${query}` : window.location.pathname, {});
+	}
+
+	const filterCtx: FilterContextValue = {
+		getValue: (param) => filters[param] ?? '',
+		setValue: (param, value) => {
+			filters = { ...filters, [param]: value };
+			syncFiltersToURL();
+			postEmbedMessage('filter', { filters });
+			const hasLiveFilters = liveCells.some((c) => c.isLive);
+			if (hasLiveFilters) void runAllLiveCells();
+		},
+		setValues: (values) => {
+			filters = { ...filters, ...values };
+			syncFiltersToURL();
+			postEmbedMessage('filter', { filters });
+			const hasLiveFilters = liveCells.some((c) => c.isLive);
+			if (hasLiveFilters) void runAllLiveCells();
+		}
+	};
+	setContext(FILTER_CONTEXT_KEY, filterCtx);
+	setContext(SUPPRESS_INLINE_FILTERS_KEY, suppressInlineFilters);
+
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+	function startPolling(): void {
+		if (pollTimer) return;
+		const interval = data.pollIntervalMs ?? DEFAULT_POLL_MS;
+		pollTimer = setInterval(() => void runAllLiveCells(), interval);
+	}
+
+	function stopPolling(): void {
+		if (!pollTimer) return;
+		clearInterval(pollTimer);
+		pollTimer = null;
+	}
+
+	function handleVisibilityChange(): void {
+		if (document.hidden) {
+			stopPolling();
+		} else {
+			void runAllLiveCells();
+			startPolling();
+		}
+	}
+
+	function printReport(): void {
+		window.print();
+	}
+
+	function exportHtml(): void {
+		window.open(`/api/shares/${data.token}/export/html`, '_blank');
+	}
+
+	onMount(() => {
+		const initial = new URLSearchParams(window.location.search);
+		if ([...initial.keys()].length > 0) {
+			filters = Object.fromEntries(initial.entries());
+		}
+		if (liveCells.length > 0 && Object.keys(initialLiveResults).length === 0) {
+			void runAllLiveCells();
+		}
+		startPolling();
+		document.addEventListener('visibilitychange', handleVisibilityChange);
+		if (data.theme === 'dark') document.documentElement.classList.add('dark');
+		else if (data.theme === 'light') document.documentElement.classList.remove('dark');
+		if (embed) {
+			document.documentElement.classList.add('report-embed');
+			postEmbedMessage('ready', { token: data.token });
+		}
+	});
+
+	onDestroy(() => {
+		stopPolling();
+		if (typeof document !== 'undefined')
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
+	});
+
+	const secondsAgo = $derived.by(() => {
+		if (!lastUpdatedAt) return null;
+		return Math.max(0, Math.round((Date.now() - lastUpdatedAt) / 1000));
+	});
+</script>
+
+<svelte:head>
+	{#if themeOverrideCss}
+		<style>{themeOverrideCss}</style>
+	{/if}
+</svelte:head>
+
+<div class="report-page" class:report-page--embed={embed}>
+	{#if !embed}
+		<header class="report-header">
+			<div class="report-header-main">
+				<h1>{data.notebookName}</h1>
+				{#if data.description}
+					<p class="report-description">{data.description}</p>
+				{/if}
+			</div>
+			<div class="report-header-actions no-print">
+				{#if liveCells.length > 0}
+					<span class="report-live-badge">
+						● Live{#if secondsAgo !== null}&nbsp;· updated {secondsAgo}s ago{/if}
+					</span>
+				{/if}
+				<Button variant="outline" size="sm" onclick={printReport} title="Print">
+					<Printer class="h-3.5 w-3.5" />
+				</Button>
+				<Button variant="outline" size="sm" onclick={exportHtml} title="Export HTML">
+					<Download class="h-3.5 w-3.5" />
+				</Button>
+			</div>
+		</header>
+	{/if}
+
+	{#if filterDefs.length > 0}
+		<ReportFilterBar filters={filterDefs} />
+	{/if}
+
+	<div class="report-cells">
+		{#each visibleCells as cell (cell.id)}
+			{#if cell.cellType === 'markdown'}
+				{#if cell.markdown?.trim()}
+					{@const result = renderMarkdocCell(cell.markdown, markdocCells)}
+					<div class="report-markdown report-section">
+						<MarkdocRenderer content={result.tree} errors={result.errors} notebookId="" />
+					</div>
+				{/if}
+			{:else if cell.cellType === 'query' || cell.cellType === 'python'}
+				<div class="report-section">
+					<ReportCell
+						{cell}
+						rows={cell.isLive
+							? (liveResults[cell.id]?.rows ?? null)
+							: (frozenResultForCell(cell)?.rows ?? null)}
+						columns={cell.isLive
+							? (liveResults[cell.id]?.columns ?? null)
+							: (frozenResultForCell(cell)?.columns ?? null)}
+						pythonOutput={cell.cellType === 'python' ? pythonOutputForCell(cell) : null}
+						loading={loadingCellIds.has(cell.id)}
+						error={liveErrors[cell.id] ?? null}
+						exportEnabled={true}
+						oncomment={() => reviewSidebar?.openForCell(cell.id)}
+						{ssrThemeOverrides}
+					/>
+				</div>
+			{/if}
+		{/each}
+	</div>
+</div>
+
+<ShareReviewSidebar bind:this={reviewSidebar} shareToken={data.token} {isAuthenticated} />
+
+<style>
+	.report-page--embed {
+		padding: 1rem 1rem 2rem;
+		max-width: none;
+	}
+	.report-page {
+		max-width: 56rem;
+		margin: 0 auto;
+		padding: 3rem 1.5rem 6rem;
+		color: var(--foreground);
+		background: var(--background);
+	}
+	.report-header {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 0.75rem;
+		margin-bottom: 2rem;
+		border-bottom: 1px solid var(--border);
+		padding-bottom: 1rem;
+	}
+	.report-header-main h1 {
+		font-size: 1.5rem;
+		font-weight: 600;
+		margin: 0;
+	}
+	.report-description {
+		margin: 0.35rem 0 0;
+		font-size: 0.85rem;
+		color: var(--muted-foreground);
+	}
+	.report-header-actions {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-shrink: 0;
+	}
+	.report-live-badge {
+		font-size: 0.75rem;
+		color: var(--muted-foreground);
+	}
+	.report-cells {
+		display: flex;
+		flex-direction: column;
+		gap: 1.75rem;
+	}
+	.report-markdown {
+		font-size: 0.95rem;
+		line-height: 1.7;
+	}
+	/* Infographic type scale: h1 = display headline, h2 = tracked-caps section header
+	   with a heavy rule, h3 = quiet kicker/eyebrow. A real hierarchy ladder instead of
+	   three near-identical bold sizes. */
+	.report-markdown :global(h1) {
+		font-size: 2.6rem;
+		font-weight: 800;
+		letter-spacing: -0.03em;
+		margin: 0 0 1.25rem;
+		line-height: 1.05;
+	}
+	.report-markdown :global(h2) {
+		font-size: 0.95rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		border-top: 3px solid var(--foreground);
+		padding-top: 0.5rem;
+		margin: 2.25rem 0 0.9rem;
+		line-height: 1.35;
+	}
+	.report-markdown :global(h3) {
+		font-size: var(--text-2xs);
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.12em;
+		color: var(--muted-foreground);
+		margin: 1.5rem 0 0.35rem;
+	}
+	.report-markdown :global(h4),
+	.report-markdown :global(h5),
+	.report-markdown :global(h6) {
+		font-size: 1rem;
+		font-weight: 600;
+		margin: 1rem 0 0.4rem;
+	}
+	/* Blockquotes as serif-italic captions — source lines and asides. */
+	.report-markdown :global(blockquote) {
+		border: none;
+		margin: 0.5rem 0 0.75rem;
+		padding: 0;
+		font-family: var(--font-serif);
+		font-style: italic;
+		font-size: 0.85rem;
+		color: var(--muted-foreground);
+	}
+	.report-markdown :global(p) {
+		margin: 0 0 0.75rem;
+	}
+	.report-markdown :global(p:first-child) {
+		margin-top: 0;
+	}
+	.report-markdown :global(*:last-child) {
+		margin-bottom: 0;
+	}
+	.report-markdown :global(ul),
+	.report-markdown :global(ol) {
+		padding-left: 1.5rem;
+		margin: 0 0 0.75rem;
+	}
+	.report-markdown :global(li) {
+		margin-bottom: 0.25rem;
+	}
+	.report-markdown :global(pre) {
+		background: color-mix(in oklch, currentColor 6%, transparent);
+		border-radius: 0.35rem;
+		padding: 0.75rem 1rem;
+		margin: 0 0 0.75rem;
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+	.report-markdown :global(code) {
+		font-family: ui-monospace, SFMono-Regular, monospace;
+		font-size: 0.85em;
+		background: color-mix(in oklch, currentColor 8%, transparent);
+		border-radius: 0.25rem;
+		padding: 0.1em 0.35em;
+	}
+	.report-markdown :global(pre code) {
+		background: none;
+		padding: 0;
+	}
+	.report-markdown :global(blockquote) {
+		border-left: 2px solid var(--border);
+		margin: 0 0 0.75rem;
+		padding-left: 1rem;
+		opacity: 0.8;
+	}
+	.report-markdown :global(hr) {
+		border: none;
+		border-top: 1px solid var(--border);
+		margin: 1.25rem 0;
+	}
+	.report-markdown :global(a) {
+		text-decoration: underline;
+		text-underline-offset: 2px;
+	}
+	.report-markdown :global(img) {
+		max-width: 100%;
+		border-radius: 0.35rem;
+	}
+	.report-markdown :global(table) {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.85em;
+		margin: 0 0 0.75rem;
+	}
+	.report-markdown :global(th),
+	.report-markdown :global(td) {
+		padding: 0.4rem 0.7rem;
+		border: 1px solid var(--border);
+		text-align: left;
+	}
+	.report-markdown :global(th) {
+		font-weight: 600;
+		background: color-mix(in oklch, currentColor 4%, transparent);
+	}
+
+	@media print {
+		:global(.no-print) {
+			display: none !important;
+		}
+		.report-page {
+			padding: 0;
+			max-width: none;
+		}
+		.report-section {
+			break-inside: avoid;
+			page-break-inside: avoid;
+		}
+		.report-header {
+			border-bottom-color: #ccc;
+		}
+	}
+</style>

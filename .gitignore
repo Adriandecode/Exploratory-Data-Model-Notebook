@@ -1,0 +1,101 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Generated DuckDB static assets (copied from node_modules at build time)
+/static/duckdb/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Test artifacts
+test-results/
+playwright-report/
+artifacts/demo-videos/*.webm
+artifacts/demo-videos/*.mp4
+e2e/*
+!e2e/ai-ollama-dashboard.llm.spec.ts
+!e2e/chart-switch-debug.mock.spec.ts
+!e2e/demo-recreate-full.mock.spec.ts
+!e2e/demo-recreate.mock.spec.ts
+!e2e/gui-prql-switch-debug.mock.spec.ts
+!e2e/inline-typing-repro.mock.spec.ts
+!e2e/mock-browser-defaults.ts
+!e2e/saas-flows.mock.spec.ts
+
+# Demo video / YouTube upload artifacts
+/scripts/demo-video/remotion/
+/scripts/demo-video/detect-markers.mjs
+/scripts/demo-video/**/*.mp4
+/scripts/demo-video/**/*.webm
+/scripts/demo-video/**/*.mov
+/scripts/demo-video/**/*.m4v
+/scripts/demo-video/**/*.png
+/scripts/demo-video/**/*youtube*
+/scripts/demo-video/**/*yt*
+
+# Temp/scratch files
+.tmp-*.json
+.vitest-*.json
+generated_datasets/
+generated_datasets_round2/
+*.csv
+
+# Editor
+.cursor/
+.claude/
+.vscode/
+
+src-tauri/
+demo-assets/
+FEATURES.md
+project/
+projects/
+.pnpm-store/
+graphify-out/
+artifacts/
+.agents
+.codex/
+
+# === Secrets & credentials (auto-added by batch manager) ===
+.env
+*.env
+*.env.*
+.env.local
+.env.production
+.env.staging
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+secrets.yaml
+secrets.yml
+credentials.json
+service-account*.json
+terraform.tfvars
+terraform.tfvars.json
+.kubeconfig
+kubeconfig
+# === End secrets ===

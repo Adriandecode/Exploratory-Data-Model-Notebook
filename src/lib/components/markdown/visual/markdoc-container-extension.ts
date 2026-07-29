@@ -1,0 +1,720 @@
+import { Node, mergeAttributes } from '@tiptap/core';
+import type { Node as ProseMirrorNode } from '@tiptap/pm/model';
+import { mount, unmount } from 'svelte';
+import type { Cell } from '$lib/stores/notebook.svelte';
+import { parseAttrsJson } from './widget-registry';
+import { markdocAttrsToJson } from '$lib/services/markdoc-ast';
+import ContainerChrome from './ContainerChrome.svelte';
+import MermaidContainerView from './MermaidContainerView.svelte';
+import { mermaidCodeFromContainerNode } from './mermaid-code';
+import { reactiveProps } from './reactive-props.svelte';
+import { markdownToPmDocument, serializePmNodeToMarkdown } from '$lib/services/markdoc-pm';
+import { GRID_GAP_PRESETS, COLUMNS_GAP_PRESETS } from '$lib/services/markdoc-style-presets';
+import { resolveBareVariablePath } from '$lib/services/markdoc-interp';
+import LoopPreviewView from './LoopPreviewView.svelte';
+
+export interface MarkdocContainerExtensionContext {
+	getCells: () => Cell[];
+	getNotebookId?: () => string;
+	/** Report view is read-only: editing chrome (toolbar, grid-cell guides, selection
+	 * indicator) must not appear — only the static-render appearance. */
+	reportView?: () => boolean;
+	/** Subscribe to external cell-data changes (a query cell finishing a run
+	 * elsewhere never touches this node, so nothing else tells the NodeView to
+	 * re-pull getCells() and re-derive its each/group preview or live badges). */
+	onCellsRefresh?: (fn: () => void) => () => void;
+}
+
+/** Matches the icon set CalloutWidget.svelte uses for report/static rendering, kept as raw
+ * SVG here since this NodeView is built with vanilla DOM APIs, not Svelte components. */
+const CALLOUT_ICON_SVG: Record<string, string> = {
+	info: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>',
+	success:
+		'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+	warning:
+		'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',
+	error:
+		'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>'
+};
+
+const LOGIC_PREVIEW_TAGS = new Set(['each', 'group']);
+
+/** Resolve a loop `data` attr (literal array or `$cell.rows` ref) to rows, or null. */
+function resolveLoopRows(data: unknown, cells: Cell[]): unknown[] | null {
+	if (Array.isArray(data)) return data;
+	if (typeof data === 'string' && data.trim().startsWith('$')) {
+		const value = resolveBareVariablePath(data, cells);
+		if (Array.isArray(value)) return value;
+	}
+	return null;
+}
+
+function syncTabsStrip(
+	dom: HTMLElement,
+	contentDOM: HTMLElement,
+	activeIndex: number,
+	onSelect: (index: number) => void
+) {
+	let strip = dom.querySelector(':scope > .md-tabs-strip') as HTMLElement | null;
+	if (!strip) {
+		strip = document.createElement('div');
+		strip.className = 'md-tabs-strip';
+		strip.setAttribute('role', 'tablist');
+		dom.insertBefore(strip, contentDOM);
+	}
+	strip.replaceChildren();
+	const tabNodes = [
+		...contentDOM.querySelectorAll(
+			':scope > .markdoc-container-node[data-tag="tab"], :scope > .markdoc-container-node.is-tab'
+		)
+	];
+	tabNodes.forEach((tabEl, i) => {
+		const attrs = parseAttrsJson(tabEl.getAttribute('data-attrs-json') ?? '{}');
+		const label = String(attrs.label ?? `Tab ${i + 1}`);
+		const btn = document.createElement('button');
+		btn.type = 'button';
+		btn.className = `md-tab-btn${i === activeIndex ? ' active' : ''}`;
+		btn.setAttribute('role', 'tab');
+		btn.setAttribute('aria-selected', String(i === activeIndex));
+		btn.textContent = label;
+		btn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			onSelect(i);
+		});
+		strip!.appendChild(btn);
+		tabEl.classList.toggle('md-tab-active', i === activeIndex);
+	});
+}
+
+function applyContainerSemantics(
+	dom: HTMLElement,
+	contentDOM: HTMLElement,
+	tagName: string,
+	attrsJson: string,
+	tabState?: { activeIndex: number; onTabSelect?: (i: number) => void },
+	isReport = false
+) {
+	const attrs = parseAttrsJson(attrsJson);
+	// className reset must not wipe ProseMirror's selection marker mid-update.
+	const wasSelected = dom.classList.contains('ProseMirror-selectednode');
+	dom.className = 'markdoc-container-node group/container';
+	if (isReport) dom.classList.add('is-report');
+	if (wasSelected) dom.classList.add('ProseMirror-selectednode');
+	// A container's own span (e.g. a card inside a grid) lands on the node-view
+	// wrapper, which is the actual grid child in the editor.
+	const ownSpan = Number(attrs.span ?? 1);
+	dom.style.gridColumn =
+		Number.isFinite(ownSpan) && ownSpan > 1 ? `span ${Math.min(ownSpan, 6)}` : '';
+	contentDOM.className = 'markdoc-container-content';
+	contentDOM.style.cssText = '';
+	dom.dataset.tag = tagName;
+	dom.dataset.attrsJson = attrsJson;
+
+	const semantic = [
+		'is-grid',
+		'is-columns',
+		'is-column',
+		'is-callout',
+		'is-card',
+		'is-tabs',
+		'is-tab',
+		'is-details',
+		'is-wysiwyg',
+		'md-grid',
+		'md-columns',
+		'md-column',
+		'md-callout',
+		'md-card',
+		'md-tabs',
+		'md-details',
+		'is-open',
+		'md-tab-active'
+	];
+	const removableSemantic =
+		tagName === 'tab' ? semantic.filter((className) => className !== 'md-tab-active') : semantic;
+	dom.classList.remove(...removableSemantic);
+	contentDOM.classList.remove(...semantic.filter((c) => c.startsWith('md-')));
+	for (const key of Object.keys(dom.dataset)) {
+		if (key.startsWith('callout')) delete dom.dataset[key];
+	}
+
+	// Remove dynamic chrome from prior renders. MUST stay scoped to direct children:
+	// an unscoped querySelector matches the same classes inside nested child node
+	// views (a card inside a grid, tabs inside a column, ...) and rips their chrome
+	// out — a childList mutation the child's ProseMirror DOMObserver treats as a
+	// user edit, which can commit real content loss to the document.
+	dom.querySelector(':scope > .md-tabs-strip')?.remove();
+	dom.querySelector(':scope > .md-details-summary')?.remove();
+	dom.querySelector(':scope > .md-card-title-editor')?.remove();
+	dom.querySelector(':scope > .md-callout-icon')?.remove();
+	dom.querySelector(':scope > .md-callout-title-editor')?.remove();
+
+	if (tagName === 'grid') {
+		const cols = Number(attrs.cols ?? 3);
+		dom.classList.add('is-grid', 'is-wysiwyg');
+		contentDOM.classList.add('md-grid');
+		contentDOM.style.setProperty('--md-grid-cols', String(cols));
+		contentDOM.style.setProperty('--md-grid-gap', GRID_GAP_PRESETS[String(attrs.gap ?? 'default')]);
+		if (attrs.striped) contentDOM.dataset.striped = 'true';
+		else delete contentDOM.dataset.striped;
+	} else if (tagName === 'columns') {
+		dom.classList.add('is-columns', 'is-wysiwyg');
+		contentDOM.classList.add('md-columns');
+		contentDOM.style.setProperty(
+			'--md-columns-gap',
+			COLUMNS_GAP_PRESETS[String(attrs.gap ?? 'default')]
+		);
+	} else if (tagName === 'column') {
+		dom.classList.add('is-column', 'is-wysiwyg');
+		contentDOM.classList.add('md-column');
+		if (attrs.width) contentDOM.style.flexBasis = String(attrs.width);
+	} else if (tagName === 'callout') {
+		const type = String(attrs.type ?? 'info');
+		dom.classList.add('is-callout', 'is-wysiwyg', `md-callout--${type}`);
+		contentDOM.classList.add('md-callout');
+		const iconEl = document.createElement('span');
+		iconEl.className = 'md-callout-icon';
+		iconEl.innerHTML = CALLOUT_ICON_SVG[type] ?? CALLOUT_ICON_SVG.info;
+		dom.insertBefore(iconEl, contentDOM);
+		if (attrs.title) {
+			const titleEl = document.createElement('p');
+			titleEl.className = 'md-callout-title-editor';
+			titleEl.textContent = String(attrs.title);
+			dom.insertBefore(titleEl, contentDOM);
+		}
+	} else if (tagName === 'card') {
+		const accent = String(attrs.accent ?? 'neutral');
+		dom.classList.add('is-card', 'is-wysiwyg');
+		if (accent !== 'neutral') dom.classList.add(`md-card--${accent}`);
+		contentDOM.classList.add('md-card');
+		if (attrs.title) {
+			const titleEl = document.createElement('div');
+			titleEl.className = 'md-card-title md-card-title-editor';
+			titleEl.textContent = String(attrs.title);
+			dom.insertBefore(titleEl, contentDOM);
+		}
+	} else if (tagName === 'tabs') {
+		dom.classList.add('is-tabs', 'is-wysiwyg', 'md-tabs');
+		contentDOM.classList.add('md-tabs-body');
+		const active = tabState?.activeIndex ?? 0;
+		syncTabsStrip(dom, contentDOM, active, (i) => tabState?.onTabSelect?.(i));
+	} else if (tagName === 'tab') {
+		dom.classList.add('is-tab', 'is-wysiwyg');
+		contentDOM.classList.add('md-tab-panel-content');
+	} else if (tagName === 'details') {
+		const summary = String(attrs.summary ?? 'Details');
+		const open = Boolean(attrs.open);
+		dom.classList.add('is-details', 'is-wysiwyg', 'md-details');
+		if (open) dom.classList.add('is-open');
+		contentDOM.classList.add('md-details-body');
+		const summaryBtn = document.createElement('button');
+		summaryBtn.type = 'button';
+		summaryBtn.className = 'md-details-summary';
+		summaryBtn.setAttribute('aria-expanded', String(open));
+		summaryBtn.textContent = summary;
+		summaryBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			dom.classList.toggle('is-open');
+			summaryBtn.setAttribute('aria-expanded', String(dom.classList.contains('is-open')));
+		});
+		dom.insertBefore(summaryBtn, contentDOM);
+	} else if (tagName === 'mermaid') {
+		dom.classList.add('is-mermaid', 'is-wysiwyg', 'md-mermaid');
+	} else if (tagName === 'if' || tagName === 'each' || tagName === 'group') {
+		dom.classList.add('is-logic', 'is-wysiwyg');
+	}
+}
+
+export const MarkdocContainerExtension = Node.create({
+	name: 'markdocContainer',
+	group: 'block',
+	content: 'block+',
+	defining: true,
+	isolating: true,
+
+	addAttributes() {
+		return {
+			tagName: { default: 'callout' },
+			attrsJson: { default: '{}' }
+		};
+	},
+
+	parseHTML() {
+		return [{ tag: 'div[data-markdoc-container]' }];
+	},
+
+	renderHTML({ HTMLAttributes }) {
+		return ['div', mergeAttributes(HTMLAttributes, { 'data-markdoc-container': 'true' }), 0];
+	},
+
+	addNodeView() {
+		const ctx = this.options.context as MarkdocContainerExtensionContext | undefined;
+		return ({ node, editor, getPos }) => {
+			const dom = document.createElement('div');
+			const contentDOM = document.createElement('div');
+			dom.appendChild(contentDOM);
+
+			let component: ReturnType<typeof mount> | null = null;
+			let chromeHost: HTMLDivElement | null = null;
+			let tagName = String(node.attrs.tagName ?? 'callout');
+			let attrsJson = String(node.attrs.attrsJson ?? '{}');
+			let isSelected = false;
+			let activeTabIndex = 0;
+			let tabObserver: MutationObserver | null = null;
+			let tabSyncQueued = false;
+			let tabPollHandle = 0;
+			let tabPollFrames = 0;
+			let mermaidMode: 'visual' | 'source' = 'visual';
+			let mermaidHost: HTMLDivElement | null = null;
+			let mermaidComponent: ReturnType<typeof mount> | null = null;
+			let lastMermaidCode: string | null = null;
+			let pmNode: ProseMirrorNode = node;
+
+			const isReportView = () => ctx?.reportView?.() ?? false;
+			const runApplyContainerSemantics = (tabState?: {
+				activeIndex: number;
+				onTabSelect?: (i: number) => void;
+			}) => applyContainerSemantics(dom, contentDOM, tagName, attrsJson, tabState, isReportView());
+
+			const currentMermaidCode = () =>
+				mermaidCodeFromContainerNode(pmNode, attrsJson, ctx?.getCells() ?? []);
+
+			// Toggle which surface is visible. Called both from the node-view lifecycle
+			// and (crucially) from the MermaidContainerView toggle handler — so it must
+			// NEVER unmount that component synchronously, or we'd tear down the very
+			// component whose click handler is still on the stack (lifecycle_double_unmount,
+			// which wedges the toggle so further clicks do nothing).
+			const applyMermaidView = () => {
+				if (tagName !== 'mermaid') {
+					if (mermaidComponent) {
+						unmount(mermaidComponent);
+						mermaidComponent = null;
+					}
+					mermaidHost?.remove();
+					mermaidHost = null;
+					lastMermaidCode = null;
+					contentDOM.style.display = '';
+					dom.classList.remove('is-mermaid-visual', 'is-mermaid-source');
+					return;
+				}
+				if (!mermaidHost) {
+					mermaidHost = document.createElement('div');
+					mermaidHost.className = 'mermaid-container-host markdown-surface';
+					dom.insertBefore(mermaidHost, contentDOM);
+				}
+				const isVisual = mermaidMode === 'visual';
+				contentDOM.style.display = isVisual ? 'none' : '';
+				dom.classList.toggle('is-mermaid-visual', isVisual);
+				dom.classList.toggle('is-mermaid-source', !isVisual);
+				renderMermaidChrome();
+			};
+
+			const handleMermaidModeChange = (mode: 'visual' | 'source') => {
+				mermaidMode = mode;
+				const isVisual = mode === 'visual';
+				// The MermaidContainerView owns its own `mode` state and re-renders its
+				// bar + diagram itself; here we only flip which surface (diagram vs. the
+				// editable code contentDOM) is shown. No remount — see applyMermaidView.
+				contentDOM.style.display = isVisual ? 'none' : '';
+				dom.classList.toggle('is-mermaid-visual', isVisual);
+				dom.classList.toggle('is-mermaid-source', !isVisual);
+				if (!isVisual) {
+					const pos = getPos();
+					if (typeof pos === 'number') {
+						editor.chain().focus().setNodeSelection(pos).run();
+						requestAnimationFrame(() => {
+							const codeEl = contentDOM.querySelector('pre, code, .cm-content');
+							if (codeEl instanceof HTMLElement) codeEl.focus();
+						});
+					}
+				}
+			};
+
+			// Mount once; thereafter only remount when the diagram *code* actually
+			// changes (edits come from typing in contentDOM, never from the toggle),
+			// so we never unmount during the toggle's own event handler.
+			const renderMermaidChrome = () => {
+				if (tagName !== 'mermaid' || !mermaidHost) return;
+				const code = currentMermaidCode();
+				if (mermaidComponent && code === lastMermaidCode) return;
+				lastMermaidCode = code;
+				if (mermaidComponent) {
+					unmount(mermaidComponent);
+					mermaidComponent = null;
+				}
+				mermaidComponent = mount(MermaidContainerView, {
+					target: mermaidHost,
+					props: {
+						code,
+						mode: mermaidMode,
+						onModeChange: handleMermaidModeChange
+					}
+				});
+			};
+
+			// ── each/group live preview (Webflow collection-list style) ──────────
+			// Same dual-surface approach as mermaid above: contentDOM stays the
+			// editable template (and the single source of truth for round-tripping);
+			// a mounted LoopPreviewView renders the expanded output. `logicOverride`
+			// is the user's explicit toggle; when null, mode is auto: preview when
+			// the data attr resolves to a non-empty array, template otherwise.
+			let logicOverride: 'preview' | 'template' | null = null;
+			let loopHost: HTMLDivElement | null = null;
+			let loopComponent: ReturnType<typeof mount> | null = null;
+			let loopProps: {
+				source: string;
+				tagName: string;
+				notebookId: string;
+				cells: Cell[];
+			} | null = null;
+			let lastLoopSource: string | null = null;
+
+			const loopRowCount = (): number | null => {
+				const rows = resolveLoopRows(parseAttrsJson(attrsJson).data, ctx?.getCells() ?? []);
+				return rows ? rows.length : null;
+			};
+
+			const effectiveLogicMode = (): 'preview' | 'template' => {
+				if (logicOverride) return logicOverride;
+				const count = loopRowCount();
+				return count !== null && count > 0 ? 'preview' : 'template';
+			};
+
+			const applyLoopView = () => {
+				if (!LOGIC_PREVIEW_TAGS.has(tagName)) {
+					if (loopComponent) {
+						unmount(loopComponent);
+						loopComponent = null;
+					}
+					loopHost?.remove();
+					loopHost = null;
+					lastLoopSource = null;
+					if (dom.classList.contains('is-loop-preview')) {
+						dom.classList.remove('is-loop-preview');
+						contentDOM.style.display = '';
+					}
+					return;
+				}
+				const isPreview = effectiveLogicMode() === 'preview';
+				if (isPreview) {
+					if (!loopHost) {
+						loopHost = document.createElement('div');
+						loopHost.className = 'loop-preview-host markdown-surface';
+						dom.appendChild(loopHost);
+					}
+					const source = serializePmNodeToMarkdown(pmNode);
+					if (!loopComponent) {
+						loopProps = reactiveProps({
+							source,
+							tagName,
+							notebookId: ctx?.getNotebookId?.() ?? '',
+							cells: ctx?.getCells() ?? []
+						});
+						loopComponent = mount(LoopPreviewView, { target: loopHost, props: loopProps });
+						lastLoopSource = source;
+					} else if (loopProps) {
+						loopProps.tagName = tagName;
+						loopProps.notebookId = ctx?.getNotebookId?.() ?? '';
+						loopProps.cells = ctx?.getCells() ?? [];
+						if (source !== lastLoopSource) {
+							loopProps.source = source;
+							lastLoopSource = source;
+						}
+					}
+				}
+				if (loopHost) loopHost.style.display = isPreview ? '' : 'none';
+				contentDOM.style.display = isPreview ? 'none' : '';
+				dom.classList.toggle('is-loop-preview', isPreview);
+			};
+
+			const patchAttrs = (patch: Record<string, unknown>) => {
+				const pos = getPos();
+				if (typeof pos !== 'number') return;
+				const next = { ...parseAttrsJson(attrsJson), ...patch };
+				attrsJson = markdocAttrsToJson(next);
+				editor
+					.chain()
+					.focus()
+					.command(({ tr }) => {
+						tr.setNodeAttribute(pos, 'attrsJson', attrsJson);
+						return true;
+					})
+					.run();
+				runApplyContainerSemantics({
+					activeIndex: activeTabIndex,
+					onTabSelect: (i) => {
+						activeTabIndex = i;
+						runApplyContainerSemantics({
+							activeIndex: activeTabIndex,
+							onTabSelect: (idx) => {
+								activeTabIndex = idx;
+								runApplyContainerSemantics({
+									activeIndex: activeTabIndex,
+									onTabSelect: () => {}
+								});
+							}
+						});
+					}
+				});
+				applyLoopView();
+				renderChrome();
+			};
+
+			const addChild = () => {
+				const pos = getPos();
+				if (typeof pos !== 'number') return;
+				const containerNode = editor.state.doc.nodeAt(pos);
+				if (!containerNode) return;
+				let snippet: string | null = null;
+				if (tagName === 'columns') {
+					snippet = '{% column %}\n\n{% /column %}';
+				} else if (tagName === 'grid') {
+					snippet = '{% card %}\n\n{% /card %}';
+				} else if (tagName === 'tabs') {
+					const tabCount = containerNode.content.childCount + 1;
+					snippet = `{% tab label="Tab ${tabCount}" %}\n\n{% /tab %}`;
+				} else if (tagName === 'if') {
+					// Else divider plus an empty paragraph so the new branch has a
+					// place to type into.
+					snippet = '{% else /%}\n\nOtherwise content.';
+				}
+				if (!snippet) return;
+				const children = markdownToPmDocument(snippet).doc.content ?? [];
+				if (!children.length) return;
+				const insertPos = pos + 1 + containerNode.content.size;
+				editor.chain().focus().insertContentAt(insertPos, children).run();
+				if (tagName === 'tabs') {
+					activeTabIndex = containerNode.content.childCount;
+					requestAnimationFrame(() => applyAll());
+				}
+			};
+
+			// Chrome is mounted lazily but only ONCE; afterwards its reactive props are
+			// mutated in place and visibility is toggled via CSS. Remounting on every
+			// select/update destroyed any open dropdown inside the chrome mid-click.
+			const chromeProps = reactiveProps({
+				tagName,
+				attrs: parseAttrsJson(attrsJson),
+				cells: ctx?.getCells() ?? [],
+				selected: false,
+				logicMode: null as 'preview' | 'template' | null,
+				hasElse: false,
+				onSelect: () => {
+					const pos = getPos();
+					if (typeof pos === 'number') {
+						editor.chain().focus().setNodeSelection(pos).run();
+					}
+				},
+				onDelete: () => {
+					const pos = getPos();
+					if (typeof pos !== 'number') return;
+					editor.chain().focus().setNodeSelection(pos).deleteSelection().run();
+				},
+				onPatchAttrs: (patch: Record<string, unknown>) => patchAttrs(patch),
+				onAddChild: () => addChild(),
+				onToggleLogicMode: () => {
+					logicOverride = effectiveLogicMode() === 'preview' ? 'template' : 'preview';
+					applyLoopView();
+					renderChrome();
+				},
+				onIfState: (state: string | null) => {
+					if (state) dom.dataset.ifState = state;
+					else delete dom.dataset.ifState;
+				}
+			});
+
+			const renderChrome = () => {
+				// Chrome is always present in the DOM and hover-revealed via CSS
+				// (ContainerChrome's own opacity-0 / group-hover:opacity-100), mirroring
+				// how leaf widgets (InlineWidgetNodeView's .iw-chrome) work. It must never
+				// be gated on `isSelected` — that made it a closed loop for non-atomic
+				// container nodes (grid, columns, callout, card, ...): a plain click inside
+				// their content only ever produces a text cursor, never a NodeSelection, so
+				// there was no way to ever reach `isSelected = true` in the first place.
+				chromeProps.tagName = tagName;
+				chromeProps.attrs = parseAttrsJson(attrsJson);
+				chromeProps.cells = ctx?.getCells() ?? [];
+				chromeProps.selected = isSelected;
+				chromeProps.logicMode = LOGIC_PREVIEW_TAGS.has(tagName) ? effectiveLogicMode() : null;
+				if (tagName === 'if') {
+					let hasElse = false;
+					pmNode.forEach((child) => {
+						if (child.type.name === 'markdocWidget' && String(child.attrs.tagName) === 'else') {
+							hasElse = true;
+						}
+					});
+					chromeProps.hasElse = hasElse;
+				} else {
+					chromeProps.hasElse = false;
+				}
+
+				if (!chromeHost && !isReportView()) {
+					chromeHost = document.createElement('div');
+					chromeHost.className = 'markdoc-container-chrome';
+					dom.insertBefore(chromeHost, contentDOM);
+					component = mount(ContainerChrome, { target: chromeHost, props: chromeProps });
+				}
+			};
+
+			const applyAll = () => {
+				runApplyContainerSemantics({
+					activeIndex: activeTabIndex,
+					onTabSelect: (i) => {
+						activeTabIndex = i;
+						runApplyContainerSemantics({
+							activeIndex: activeTabIndex,
+							onTabSelect: (idx) => {
+								activeTabIndex = idx;
+								applyAll();
+							}
+						});
+					}
+				});
+				if (tagName === 'tabs') {
+					requestAnimationFrame(() => {
+						runApplyContainerSemantics({
+							activeIndex: activeTabIndex,
+							onTabSelect: (i) => {
+								activeTabIndex = i;
+								applyAll();
+							}
+						});
+					});
+				}
+			};
+
+			// Rebuild the tab strip if it is out of sync with the actual tab nodes.
+			// Returns true once at least one tab node exists (strip is now populated).
+			const trySyncTabs = () => {
+				if (tagName !== 'tabs') return true;
+				const tabCount = contentDOM.querySelectorAll(
+					':scope > .markdoc-container-node[data-tag="tab"], :scope > .markdoc-container-node.is-tab'
+				).length;
+				if (tabCount === 0) return false;
+				const stripCount = dom.querySelector(':scope > .md-tabs-strip')?.children.length ?? 0;
+				if (stripCount === tabCount) return true;
+				runApplyContainerSemantics({
+					activeIndex: activeTabIndex,
+					onTabSelect: (i) => {
+						activeTabIndex = i;
+						applyAll();
+					}
+				});
+				return true;
+			};
+
+			// Child tab node views are attributed across several frames on first
+			// render, so poll for a short window until the strip is populated.
+			const pollTabs = () => {
+				tabPollFrames += 1;
+				const ready = trySyncTabs();
+				if (ready || tabPollFrames > 40) {
+					tabPollHandle = 0;
+					return;
+				}
+				tabPollHandle = requestAnimationFrame(pollTabs);
+			};
+
+			const startTabPoll = () => {
+				if (tagName !== 'tabs') return;
+				tabPollFrames = 0;
+				if (tabPollHandle) cancelAnimationFrame(tabPollHandle);
+				tabPollHandle = requestAnimationFrame(pollTabs);
+			};
+
+			const ensureTabObserver = () => {
+				if (tagName !== 'tabs' || tabObserver) return;
+				tabObserver = new MutationObserver(() => {
+					if (tabSyncQueued) return;
+					tabSyncQueued = true;
+					requestAnimationFrame(() => {
+						tabSyncQueued = false;
+						trySyncTabs();
+					});
+				});
+				tabObserver.observe(contentDOM, {
+					attributes: true,
+					attributeFilter: ['class', 'data-tag', 'data-attrs-json'],
+					childList: true,
+					subtree: true
+				});
+				startTabPoll();
+			};
+
+			applyAll();
+			ensureTabObserver();
+			applyMermaidView();
+			applyLoopView();
+			renderChrome();
+
+			const unsubscribeCellsRefresh = ctx?.onCellsRefresh?.(() => {
+				applyLoopView();
+				renderChrome();
+			});
+
+			return {
+				dom,
+				contentDOM,
+				update(updatedNode) {
+					if (updatedNode.type.name !== 'markdocContainer') return false;
+					pmNode = updatedNode;
+					tagName = String(updatedNode.attrs.tagName ?? tagName);
+					attrsJson = String(updatedNode.attrs.attrsJson ?? attrsJson);
+					applyAll();
+					ensureTabObserver();
+					startTabPoll();
+					applyMermaidView();
+					applyLoopView();
+					renderChrome();
+					return true;
+				},
+				destroy() {
+					if (component) unmount(component);
+					if (mermaidComponent) unmount(mermaidComponent);
+					if (loopComponent) unmount(loopComponent);
+					tabObserver?.disconnect();
+					if (tabPollHandle) cancelAnimationFrame(tabPollHandle);
+					unsubscribeCellsRefresh?.();
+				},
+				selectNode() {
+					isSelected = true;
+					dom.classList.add('ProseMirror-selectednode');
+					renderChrome();
+				},
+				deselectNode() {
+					isSelected = false;
+					dom.classList.remove('ProseMirror-selectednode');
+					renderChrome();
+				},
+				stopEvent(event) {
+					const target = event.target as HTMLElement;
+					if (target.closest('.md-tabs-strip, .md-details-summary, .md-tab-btn')) return true;
+					if (
+						target.closest(
+							'.markdoc-container-chrome, .mermaid-container-host, .loop-preview-host, .markdown-mode-bar'
+						)
+					)
+						return true;
+					return false;
+				},
+				ignoreMutation(mutation) {
+					// Let ProseMirror manage the selection and real content edits inside
+					// contentDOM, but ignore everything we manage ourselves: injected
+					// chrome (tab strip, details summary, card title, container chrome)
+					// that lives outside contentDOM, and the class/attribute toggles we
+					// apply for active-tab/semantics state. Without this, ProseMirror's
+					// DOMObserver treats our DOM writes as external edits and re-renders,
+					// which recreates the node view and re-triggers our writes — an
+					// infinite render loop.
+					if (mutation.type === 'selection') return false;
+					if (mutation.type === 'attributes') return true;
+					return !contentDOM.contains(mutation.target as globalThis.Node);
+				}
+			};
+		};
+	}
+});
+
+export function createMarkdocContainerExtension(context: MarkdocContainerExtensionContext) {
+	return MarkdocContainerExtension.configure({ context });
+}
